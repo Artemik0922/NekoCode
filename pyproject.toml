@@ -4,22 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nekocode"
-version = "0.3.0"
-description = "NekoCode — архитектурный агент кода с блюпринтами и учётом техдолга"
+version = "0.4.0"
+description = "NekoCode — Claude Code аналог: агент кода с блюпринтами, техдолгом, постоянной памятью и русским интерфейсом"
 requires-python = ">=3.10"
 dependencies = [
     "rich>=13.0.0",
-    "pytest>=9.0.2",
 ]
 
 [project.scripts]
-nekocode = "mini_coding_agent:main"
+nekocode = "nekocode.cli:main"
 
 [dependency-groups]
 dev = [
   "pytest>=8.3.5",
-  "ruff>=0.4.4",
 ]
 
 [tool.setuptools]
-py-modules = ["mini_coding_agent"]
+packages = ["nekocode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

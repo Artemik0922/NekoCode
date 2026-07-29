@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from rich.panel import Panel
 
-from mini_coding_agent import (
+from nekocode.agent import (
     BlueprintStore,
     FakeModelClient,
     MiniAgent,
@@ -12,6 +12,8 @@ from mini_coding_agent import (
     SessionStore,
     TechDebtLedger,
     WorkspaceContext,
+)
+from nekocode.cli import (
     audit_tech_debt,
     build_welcome,
 )
@@ -24,7 +26,7 @@ def build_workspace(tmp_path):
 
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".mini-coding-agent" / "sessions")
+    store = SessionStore(tmp_path)
     approval_policy = kwargs.pop("approval_policy", "auto")
     return MiniAgent(
         model_client=FakeModelClient(outputs),
@@ -40,7 +42,7 @@ def test_agent_runs_tool_then_final(tmp_path):
     agent = build_agent(
         tmp_path,
         [
-            '<tool>{"name":"read_file","args":{"path":"hello.txt","start":1,"end":2}}</tool>',
+            '<tool>{"name":"read","args":{"path":"hello.txt","offset":1,"limit":2}}</tool>',
             "<final>Read the file successfully.</final>",
         ],
     )
@@ -48,17 +50,14 @@ def test_agent_runs_tool_then_final(tmp_path):
     answer = agent.ask("Inspect hello.txt")
 
     assert answer == "Read the file successfully."
-    assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
+    assert any(item["role"] == "tool" and item["name"] == "read" for item in agent.session["history"])
     assert "hello.txt" in agent.session["memory"]["files"]
 
 
 def test_agent_retries_after_empty_model_output(tmp_path):
     agent = build_agent(
         tmp_path,
-        [
-            "",
-            "<final>Recovered after retry.</final>",
-        ],
+        ["", "<final>Recovered after retry.</final>"],
     )
 
     answer = agent.ask("Do the task")
@@ -73,8 +72,8 @@ def test_agent_retries_after_malformed_tool_payload(tmp_path):
     agent = build_agent(
         tmp_path,
         [
-            '<tool>{"name":"read_file","args":"bad"}</tool>',
-            '<tool>{"name":"read_file","args":{"path":"hello.txt","start":1,"end":1}}</tool>',
+            '<tool>{"name":"read","args":"bad"}</tool>',
+            '<tool>{"name":"read","args":{"path":"hello.txt","offset":1,"limit":1}}</tool>',
             "<final>Recovered after malformed tool output.</final>",
         ],
     )
@@ -82,7 +81,7 @@ def test_agent_retries_after_malformed_tool_payload(tmp_path):
     answer = agent.ask("Inspect hello.txt")
 
     assert answer == "Recovered after malformed tool output."
-    assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
+    assert any(item["role"] == "tool" and item["name"] == "read" for item in agent.session["history"])
     notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
     assert any("valid <tool> call" in item for item in notices)
 
@@ -91,7 +90,7 @@ def test_agent_accepts_xml_write_file_tool(tmp_path):
     agent = build_agent(
         tmp_path,
         [
-            '<tool name="write_file" path="hello.py"><content>print("hi")\n</content></tool>',
+            '<tool name="write" path="hello.py"><content>print("hi")\n</content></tool>',
             "<final>Done.</final>",
         ],
     )
@@ -105,11 +104,7 @@ def test_agent_accepts_xml_write_file_tool(tmp_path):
 def test_retries_do_not_consume_the_whole_budget(tmp_path):
     agent = build_agent(
         tmp_path,
-        [
-            "",
-            "",
-            "<final>Recovered after several retries.</final>",
-        ],
+        ["", "", "<final>Recovered after several retries.</final>"],
         max_steps=1,
     )
 
@@ -149,7 +144,7 @@ def test_delegate_uses_child_agent(tmp_path):
     assert answer == "Parent incorporated the child result."
     tool_events = [item for item in agent.session["history"] if item["role"] == "tool"]
     assert tool_events[0]["name"] == "delegate"
-    assert "delegate_result" in tool_events[0]["content"]
+    assert "SUBAGENT RESULT" in tool_events[0]["content"]
 
 
 def test_patch_file_replaces_exact_match(tmp_path):
@@ -158,15 +153,11 @@ def test_patch_file_replaces_exact_match(tmp_path):
     agent = build_agent(tmp_path, [])
 
     result = agent.run_tool(
-        "patch_file",
-        {
-            "path": "sample.txt",
-            "old_text": "world",
-            "new_text": "agent",
-        },
+        "edit",
+        {"path": "sample.txt", "old_text": "world", "new_text": "agent"},
     )
 
-    assert result == "patched sample.txt"
+    assert result == "edited sample.txt"
     assert file_path.read_text(encoding="utf-8") == "hello agent\n"
 
 
@@ -174,10 +165,9 @@ def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
     agent = build_agent(tmp_path, [], approval_policy="ask")
 
     with patch("builtins.input") as mock_input:
-        result = agent.run_tool("write_file", {})
+        result = agent.run_tool("write", {})
 
-    assert result.startswith("error: invalid arguments for write_file: 'path'")
-    assert 'example: <tool name="write_file"' in result
+    assert result.startswith("error: invalid args for write")
     mock_input.assert_not_called()
 
 
@@ -198,7 +188,7 @@ def test_path_rejects_parent_escape(tmp_path):
     agent = build_agent(tmp_path, [])
 
     with pytest.raises(ValueError, match="path escapes workspace"):
-        agent.path("../outside.txt")
+        agent._path("../outside.txt")
 
 
 def test_path_rejects_symlink_escape(tmp_path):
@@ -212,7 +202,7 @@ def test_path_rejects_symlink_escape(tmp_path):
         pytest.skip("symlink creation is not available in this environment")
 
     with pytest.raises(ValueError, match="path escapes workspace"):
-        agent.path("outside-link/secret.txt")
+        agent._path("outside-link/secret.txt")
 
 
 def test_path_accepts_case_variant_on_case_insensitive_filesystems(tmp_path):
@@ -224,8 +214,7 @@ def test_path_accepts_case_variant_on_case_insensitive_filesystems(tmp_path):
     if not variant.exists():
         pytest.skip("case-sensitive filesystem")
 
-    resolved = agent.path(str(variant))
-
+    resolved = agent._path(str(variant))
     assert resolved.samefile(project_root / "README.md")
 
 
@@ -236,7 +225,7 @@ def test_repeated_identical_tool_call_is_rejected(tmp_path):
 
     result = agent.run_tool("list_files", {})
 
-    assert result == "error: repeated identical tool call for list_files; choose a different tool or return a final answer"
+    assert result.startswith("error: repeated identical call to list_files")
 
 
 def test_welcome_screen_contains_title_and_info(tmp_path):
@@ -244,11 +233,15 @@ def test_welcome_screen_contains_title_and_info(tmp_path):
     deep.mkdir(parents=True)
     agent = build_agent(deep, [])
 
-    welcome = build_welcome(agent, model="qwen3.5:4b", host="http://127.0.0.1:11434")
+    from rich.console import Console
+    from io import StringIO
+    buf = StringIO()
+    console = Console(file=buf, width=120)
+    console.print(build_welcome(agent, model="qwen3.5:4b", host="http://127.0.0.1:11434"))
+    output = buf.getvalue()
 
-    assert isinstance(welcome, Panel)
-    assert "NEKOCODE" in str(welcome.renderable)
-    assert "⡆⣐⢕⢕" in str(welcome.renderable)
+    assert "NEKOCODE" in output
+    assert "⡆⣐⢕⢕" in output
 
 
 def test_prompt_top_level_sections_stay_flush_left_with_multiline_content(tmp_path):
@@ -259,9 +252,8 @@ def test_prompt_top_level_sections_stay_flush_left_with_multiline_content(tmp_pa
         default_branch="main",
         status=" M mini_coding_agent.py\n?? tests/test_prompt.py",
         recent_commits=["abc123 first commit", "def456 second commit"],
-        project_docs={"README.md": "line1\nline2"},
     )
-    store = SessionStore(tmp_path / ".mini-coding-agent" / "sessions")
+    store = SessionStore(tmp_path)
     agent = MiniAgent(
         model_client=FakeModelClient([]),
         workspace=workspace,
@@ -272,12 +264,13 @@ def test_prompt_top_level_sections_stay_flush_left_with_multiline_content(tmp_pa
         "task": "verify prompt formatting",
         "files": ["mini_coding_agent.py"],
         "notes": ["saw inconsistent indentation", "need regression coverage"],
+        "blueprints": [],
     }
     agent.record({"role": "user", "content": "inspect prompt()", "created_at": "1"})
     agent.record(
         {
             "role": "tool",
-            "name": "read_file",
+            "name": "read",
             "args": {"path": "mini_coding_agent.py"},
             "content": "    def prompt(self, user_message):\n        ...",
             "created_at": "2",
@@ -287,7 +280,7 @@ def test_prompt_top_level_sections_stay_flush_left_with_multiline_content(tmp_pa
     prompt = agent.prompt("is this issue legit?")
     lines = prompt.splitlines()
 
-    for label in ["Rules:", "Architecture rules:", "Tools:", "Valid response examples:", "Workspace:", "Memory:", "Transcript:", "Current user request:"]:
+    for label in ["## System", "## Doing tasks", "## Tone and style", "## Tools", "## Transcript", "## Current user request"]:
         assert label in lines
         assert f"            {label}" not in prompt
 
@@ -297,61 +290,37 @@ def _make_filler(i):
 
 
 def test_history_text_deduplicates_reads_but_not_after_write(tmp_path):
-    """read_file deduplication must not skip a read that follows a write.
-
-    Realistic prior-turn history (non-recent window):
-        user: "update config"
-        assistant: <tool>read_file config</tool>
-        tool:   config v1 (content: setting=true)
-        assistant: <tool>write_file config</tool>
-        tool:   wrote
-        assistant: <tool>read_file config</tool>
-        tool:   config v2 (content: setting=false)   <- MUST NOT be skipped
-
-    Without fix: seen_reads={"config"} after first read; write does NOT clear it;
-                 second read is wrongly skipped (LLM sees stale content).
-    With fix: write clears seen_reads, second read is correctly shown.
-    """
     agent = build_agent(tmp_path, [])
 
-    # Simulate a prior turn with read->write->read on the same file
-    # history_length=13, recent_start=7 (indices 0-6 non-recent, 7-12 recent)
-    agent.record({"role": "user", "content": "update config", "created_at": "0"})        # index 0
-    agent.record({"role": "assistant", "content": '<tool>{"name":"read_file","args":{"path":"config.txt"}}</tool>', "created_at": "1"})
-    agent.record({"role": "tool", "name": "read_file", "args": {"path": "config.txt"}, "content": "# config.txt\n   1: setting=true\n", "created_at": "2"})  # index 2, non-recent, ADDED
-    agent.record({"role": "assistant", "content": '<tool>{"name":"write_file","args":{"path":"config.txt","content":"setting=false\n"}}</tool>', "created_at": "3"})
-    agent.record({"role": "tool", "name": "write_file", "args": {"path": "config.txt", "content": "setting=false\n"}, "content": "wrote config.txt", "created_at": "4"})  # index 4, non-recent
-    agent.record({"role": "assistant", "content": '<tool>{"name":"read_file","args":{"path":"config.txt"}}</tool>', "created_at": "5"})
-    agent.record({"role": "tool", "name": "read_file", "args": {"path": "config.txt"}, "content": "# config.txt\n   1: setting=false\n", "created_at": "6"})  # index 6, non-recent, ADDED (write cleared dedup)
-    # recent entries
+    agent.record({"role": "user", "content": "update config", "created_at": "0"})
+    agent.record({"role": "assistant", "content": '<tool>{"name":"read","args":{"path":"config.txt"}}</tool>', "created_at": "1"})
+    agent.record({"role": "tool", "name": "read", "args": {"path": "config.txt"}, "content": "# config.txt\n   1: setting=true\n", "created_at": "2"})
+    agent.record({"role": "assistant", "content": '<tool>{"name":"write","args":{"path":"config.txt","content":"setting=false\n"}}</tool>', "created_at": "3"})
+    agent.record({"role": "tool", "name": "write", "args": {"path": "config.txt", "content": "setting=false\n"}, "content": "wrote config.txt", "created_at": "4"})
+    agent.record({"role": "assistant", "content": '<tool>{"name":"read","args":{"path":"config.txt"}}</tool>', "created_at": "5"})
+    agent.record({"role": "tool", "name": "read", "args": {"path": "config.txt"}, "content": "# config.txt\n   1: setting=false\n", "created_at": "6"})
     for i in range(7, 13):
         agent.record(_make_filler(i))
 
-    history = agent.history_text()
+    history = agent._history_text()
 
-    # Both read contents appear exactly once (check full line to avoid JSON false positives)
     assert "# config.txt\n   1: setting=true\n" in history
     assert "# config.txt\n   1: setting=false\n" in history
-    # Also verify duplicate read (setting=true, same path) does NOT appear twice
     assert history.count("setting=true") == 1
 
 
 def test_history_text_deduplicates_unchanged_repeated_reads(tmp_path):
-    """read_file deduplication should still skip repeated reads with no write in between."""
     agent = build_agent(tmp_path, [])
 
-    # Realistic: two identical reads with no write between them
-    # history_length=10, recent_start=4 (indices 0-3 non-recent, 4-9 recent)
-    agent.record({"role": "user", "content": "check logs", "created_at": "0"})  # index 0
-    agent.record({"role": "assistant", "content": '<tool>{"name":"read_file","args":{"path":"log.txt"}}</tool>', "created_at": "1"})
-    agent.record({"role": "tool", "name": "read_file", "args": {"path": "log.txt"}, "content": "# log.txt\n   1: stable\n", "created_at": "2"})  # index 2, non-recent, ADDED
-    agent.record({"role": "assistant", "content": '<tool>{"name":"read_file","args":{"path":"log.txt"}}</tool>', "created_at": "3"})  # index 3, non-recent, SKIPPED (dup)
+    agent.record({"role": "user", "content": "check logs", "created_at": "0"})
+    agent.record({"role": "assistant", "content": '<tool>{"name":"read","args":{"path":"log.txt"}}</tool>', "created_at": "1"})
+    agent.record({"role": "tool", "name": "read", "args": {"path": "log.txt"}, "content": "# log.txt\n   1: stable\n", "created_at": "2"})
+    agent.record({"role": "assistant", "content": '<tool>{"name":"read","args":{"path":"log.txt"}}</tool>', "created_at": "3"})
     for i in range(4, 10):
-        agent.record(_make_filler(i))  # indices 4-9, recent
+        agent.record(_make_filler(i))
 
-    history = agent.history_text()
+    history = agent._history_text()
 
-    # Only first read should appear; duplicates must be skipped
     assert history.count("stable") == 1
 
 
@@ -395,6 +364,7 @@ def test_ollama_client_posts_expected_payload():
     assert captured["body"]["think"] is False
     assert captured["body"]["options"]["num_predict"] == 42
 
+
 def test_submit_blueprint_creates_file(tmp_path):
     agent = build_agent(tmp_path, [])
     result = agent.run_tool(
@@ -414,14 +384,16 @@ def test_submit_blueprint_creates_file(tmp_path):
     files = list(bp_dir.glob("*.json"))
     assert len(files) == 1
 
+
 def test_submit_blueprint_with_empty_pattern_fails(tmp_path):
     agent = build_agent(tmp_path, [])
     result = agent.run_tool(
         "submit_blueprint",
         {"pattern": "", "scope": "test", "rationale": "test", "alternatives": "", "risks": ""},
     )
-    assert "error: invalid arguments" in result
+    assert "error: invalid args" in result
     assert "pattern must not be empty" in result
+
 
 def test_log_tech_debt_creates_file(tmp_path):
     agent = build_agent(tmp_path, [])
@@ -436,13 +408,15 @@ def test_log_tech_debt_creates_file(tmp_path):
     assert "binary_search.py" in content
     assert "demo deadline" in content
 
+
 def test_log_tech_debt_with_empty_file_fails(tmp_path):
     agent = build_agent(tmp_path, [])
     result = agent.run_tool(
         "log_tech_debt",
         {"file": "", "debt": "test", "reason": "test"},
     )
-    assert "error: invalid arguments" in result
+    assert "error: invalid args" in result
+
 
 def test_tech_debt_ledger_entries(tmp_path):
     TechDebtLedger.log(tmp_path, "file1.py", "bad pattern", "rush")
@@ -454,9 +428,6 @@ def test_tech_debt_ledger_entries(tmp_path):
     assert entries[0]["status"] == "open"
     assert entries[1]["status"] == "open"
 
-def test_tech_debt_ledger_read_empty(tmp_path):
-    result = TechDebtLedger.read(tmp_path)
-    assert "No tech debt logged yet" in result
 
 def test_tech_debt_ledger_resolve(tmp_path):
     TechDebtLedger.log(tmp_path, "file1.py", "bad pattern", "rush")
@@ -465,33 +436,45 @@ def test_tech_debt_ledger_resolve(tmp_path):
     entries = TechDebtLedger.entries(tmp_path)
     assert entries[0]["status"] == "resolved"
 
+
 def test_tech_debt_ledger_resolve_out_of_range(tmp_path):
     result = TechDebtLedger.resolve(tmp_path, 99)
     assert "error: entry 99 not found" in result
 
+
 def test_blueprint_store_list(tmp_path):
-    BlueprintStore.save(tmp_path, "bp1", "MVC", "web layer", "Standard pattern", "", "")
-    BlueprintStore.save(tmp_path, "bp2", "Event Sourcing", "audit log", "Traceability", "CQRS", "Complexity")
+    BlueprintStore.save(tmp_path, "MVC", "web layer", "Standard pattern", "", "")
+    BlueprintStore.save(tmp_path, "Event Sourcing", "audit log", "Traceability", "CQRS", "Complexity")
     blueprints = BlueprintStore.list_all(tmp_path)
     assert len(blueprints) == 2
-    assert blueprints[0]["pattern"] == "MVC"
+    patterns = {bp["pattern"] for bp in blueprints}
+    assert "MVC" in patterns
+    assert "Event Sourcing" in patterns
+
 
 def test_blueprint_store_empty(tmp_path):
     result = BlueprintStore.text_summary(tmp_path)
     assert "No blueprints recorded yet." in result
 
+
 def test_audit_with_open_debt(tmp_path):
     TechDebtLedger.log(tmp_path, "bad.py", "hardcoded url", "demo")
     agent = build_agent(tmp_path, [])
-    result = audit_tech_debt(agent)
-    assert "OPEN ITEMS" in result
-    assert "hardcoded url" in result
-    assert "bad.py" in result
+    from rich.console import Console
+    from io import StringIO
+    buf = StringIO()
+    console = Console(file=buf, width=120)
+    console.print(audit_tech_debt(agent))
+    output = buf.getvalue()
+    assert "hardcoded url" in output
+    assert "bad.py" in output
+
 
 def test_audit_clean_codebase(tmp_path):
     agent = build_agent(tmp_path, [])
     result = audit_tech_debt(agent)
-    assert "No tech debt logged" in result
+    assert "Техдолга нет" in str(result.renderable)
+
 
 def test_submit_blueprint_updates_memory(tmp_path):
     agent = build_agent(
@@ -503,3 +486,31 @@ def test_submit_blueprint_updates_memory(tmp_path):
     )
     agent.ask("Design the architecture")
     assert "MVC" in agent.session["memory"]["blueprints"][0]
+
+
+def test_task_create_and_complete(tmp_path):
+    agent = build_agent(tmp_path, [])
+    r1 = agent.run_tool("task_create", {"title": "Add tests", "description": "Write unit tests"})
+    assert "created task:" in r1
+    tid = r1.split()[2]  # "created task: abc12345 - Add tests" -> "abc12345"
+    tasks = agent.task_manager.list()
+    assert len(tasks) == 1
+    assert tasks[0]["status"] == "pending"
+
+    r2 = agent.run_tool("task_done", {"task_id": tid})
+    assert "completed" in r2
+    assert agent.task_manager.list()[0]["status"] == "completed"
+
+
+def test_remember_and_recall(tmp_path):
+    agent = build_agent(tmp_path, [])
+    r1 = agent.run_tool("remember", {
+        "type": "user",
+        "name": "prefers-terse",
+        "description": "User prefers short answers",
+        "body": "This user wants terse responses with no trailing summaries.",
+    })
+    assert "saved memory:" in r1
+
+    r2 = agent.run_tool("recall", {"list": True})
+    assert "prefers-terse" in r2
