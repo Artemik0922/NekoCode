@@ -237,7 +237,7 @@ def test_welcome_screen_contains_title_and_info(tmp_path):
     from io import StringIO
     buf = StringIO()
     console = Console(file=buf, width=120)
-    console.print(build_welcome(agent, model="qwen3.5:4b", host="http://127.0.0.1:11434"))
+    console.print(build_welcome(agent, model="qwen3.5:4b", provider_name="ollama"))
     output = buf.getvalue()
 
     assert "NEKOCODE" in output

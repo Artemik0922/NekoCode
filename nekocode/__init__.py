@@ -1,3 +1,8 @@
-"""NekoCode — Claude Code аналог с блюпринтами, техдолгом и русским интерфейсом."""
+"""NekoCode — Claude Code аналог с блюпринтами, техдолгом и русским интерфейсом.
 
-__version__ = "0.4.0"
+Провайдеры: ollama, openai, anthropic, google, custom.
+Под-агенты: explore, plan, general-purpose.
+Память: файловая (.agent/memory/), сессионная, постоянная.
+"""
+
+__version__ = "0.5.0"

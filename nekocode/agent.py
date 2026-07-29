@@ -5,6 +5,9 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -233,20 +236,59 @@ class TaskManager:
         return list(self.tasks.values())
 
 
+# ── Skills Manager ─────────────────────────────────────────────────
+class SkillsManager:
+    def __init__(self, root, dirs=None):
+        self.root = Path(root)
+        self.dirs = [Path(d) if Path(d).is_absolute() else self.root / d for d in (dirs or [])]
+
+    def list_names(self):
+        names = []
+        for d in self.dirs:
+            if d.exists():
+                for entry in d.iterdir():
+                    if entry.is_dir() and (entry / "SKILL.md").exists():
+                        names.append(entry.name)
+        return sorted(set(names))
+
+    def load(self, name):
+        for d in self.dirs:
+            skill_dir = d / name
+            if skill_dir.exists() and (skill_dir / "SKILL.md").exists():
+                text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+                return {"name": name, "content": text, "dir": str(skill_dir)}
+        return None
+
+    def descriptions(self):
+        result = []
+        for name in self.list_names():
+            skill = self.load(name)
+            if skill:
+                desc = ""
+                for line in skill["content"].splitlines():
+                    if line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip().strip('"')
+                        break
+                result.append(f"- {name}: {desc}" if desc else f"- {name}")
+        return "\n".join(result) if result else "No skills installed."
+
+
 # ── MiniAgent Core ─────────────────────────────────────────────────
 class MiniAgent:
     def __init__(self, model_client, workspace, session_store, memory_store=None,
                  session=None, approval_policy="ask", max_steps=8, max_new_tokens=1024,
-                 depth=0, max_depth=2, read_only=False):
+                 depth=0, max_depth=2, read_only=False, config=None):
         self.model_client = model_client
         self.workspace = workspace
         self.root = Path(workspace.repo_root)
+        self.config = config or {}
         self.session_store = session_store
         self.memory_store = memory_store or MemoryStore(self.root).init()
+        self.skills = SkillsManager(self.root, self.config.get("skills_dirs", [".claude/skills"]))
         self.task_manager = TaskManager()
-        self.approval_policy = approval_policy
-        self.max_steps = max_steps
-        self.max_new_tokens = max_new_tokens
+        self.approval_policy = approval_policy or self.config.get("approval", "ask")
+        self.max_steps = max_steps or int(self.config.get("max_steps", 8))
+        self.max_new_tokens = max_new_tokens or int(self.config.get("max_new_tokens", 1024))
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -260,8 +302,9 @@ class MiniAgent:
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, memory_store=None, session_id=None, **kwargs):
+        session = session_store.load(session_id) if session_id else None
         return cls(model_client=model_client, workspace=workspace, session_store=session_store,
-                   memory_store=memory_store, session=session_store.load(session_id), **kwargs)
+                   memory_store=memory_store, session=session, **kwargs)
 
     def prompt(self, user_message):
         return "\n\n".join([
@@ -485,7 +528,16 @@ class MiniAgent:
             if not str(args.get("body", "")).strip():
                 raise ValueError("body must not be empty")
         elif name == "recall":
-            pass  # optional slug or list=True
+            pass
+        elif name == "web_fetch":
+            if not str(args.get("url", "")).strip():
+                raise ValueError("url must not be empty")
+        elif name == "web_search":
+            if not str(args.get("query", "")).strip():
+                raise ValueError("query must not be empty")
+        elif name == "skill":
+            if not str(args.get("name", "")).strip():
+                raise ValueError("name must not be empty")
 
     def _approve(self, name, args):
         if self.read_only:
@@ -778,6 +830,49 @@ def tool_list_files(agent, args):
     return "\n".join(lines) or "(empty)"
 
 
+def tool_web_fetch(agent, args):
+    url = str(args["url"]).strip()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "NekoCode/0.5"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+        return clip(content, 8000)
+    except Exception as exc:
+        return f"error fetching {url}: {exc}"
+
+
+def tool_web_search(agent, args):
+    query = str(args["query"]).strip()
+    try:
+        import http.client
+        encoded = urllib.parse.quote(query)
+        req = urllib.request.Request(
+            f"https://html.duckduckgo.com/html/?q={encoded}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        results = []
+        for match in re.finditer(r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', html, re.S):
+            url = match.group(1)
+            title = re.sub(r"<[^>]+>", "", match.group(2)).strip()
+            results.append(f"- [{title}]({url})")
+            if len(results) >= 8:
+                break
+        return "\n".join(results) if results else "(no results)"
+    except Exception as exc:
+        return f"error searching: {exc}"
+
+
+def tool_skill(agent, args):
+    name = str(args["name"])
+    skill = agent.skills.load(name)
+    if skill is None:
+        available = agent.skills.list_names()
+        return f"skill '{name}' not found. Installed: {', '.join(available) if available else 'none'}"
+    return f"# Skill: {name}\n\n{skill['content']}"
+
+
 # Register tools ────────────────────────────────────────────────────
 _RI = MiniAgent.register
 _RI("read", False, {"path": "str", "offset": "int=1", "limit": "int=200"})(tool_read)
@@ -795,6 +890,9 @@ _RI("task_update", False, {"task_id": "str", "status": "str"})(tool_task_update)
 _RI("task_done", False, {"task_id": "str"})(tool_task_done)
 _RI("remember", False, {"type": "str", "name": "str", "description": "str=''", "body": "str"})(tool_remember)
 _RI("recall", False, {"slug": "str=''", "list": "bool=False"})(tool_recall)
+_RI("web_fetch", False, {"url": "str"})(tool_web_fetch)
+_RI("web_search", False, {"query": "str"})(tool_web_search)
+_RI("skill", False, {"name": "str", "args": "str=''"})(tool_skill)
 # Backward compat aliases
 _RI("read_file", False, {"path": "str", "offset": "int=1", "limit": "int=200"})(tool_read)
 _RI("write_file", True, {"path": "str", "content": "str"})(tool_write)
