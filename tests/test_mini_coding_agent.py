@@ -248,7 +248,7 @@ def test_welcome_screen_contains_title_and_info(tmp_path):
 
     assert isinstance(welcome, Panel)
     assert "NEKOCODE" in str(welcome.renderable)
-    assert "O   O" in str(welcome.renderable)
+    assert "⡆⣐⢕⢕" in str(welcome.renderable)
 
 
 def test_prompt_top_level_sections_stay_flush_left_with_multiline_content(tmp_path):
