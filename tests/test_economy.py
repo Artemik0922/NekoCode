@@ -240,6 +240,42 @@ class TestContextWindow:
         assert "sys" in result
         assert "hi" in result
 
+    def test_assemble_with_memory_block(self):
+        w = ContextWindow(budget=TokenBudget(total=5000, system=500, user_msg=200, history=1000, reserve=500))
+        result = w.assemble(
+            history=[],
+            system_prompt="You are a bot.",
+            user_msg="hello",
+            memory_block="- Task: fix tests\n- Files: foo.py\n- Notes: none",
+        )
+        assert "Task: fix tests" in result
+        assert "You are a bot." in result
+        assert "hello" in result
+
+    def test_assemble_memory_block_compressed(self):
+        w = ContextWindow(
+            budget=TokenBudget(total=500, system=100, user_msg=50, history=100, reserve=200),
+        )
+        long_memory = "- Task: " + "x" * 500
+        result = w.assemble(
+            history=[],
+            system_prompt="sys",
+            user_msg="hi",
+            memory_block=long_memory,
+        )
+        assert "Task:" in result
+        assert "sys" in result
+
+    def test_assemble_without_memory(self):
+        w = ContextWindow(budget=TokenBudget(total=1000, system=200, user_msg=100, history=300, reserve=400))
+        result = w.assemble(
+            history=[{"role": "user", "content": "test"}],
+            system_prompt="sys",
+            user_msg="hi",
+        )
+        assert "sys" in result
+        assert "hi" in result
+
     def test_usage_property(self):
         w = ContextWindow(budget=TokenBudget(total=1000, system=200, user_msg=100, history=300, reserve=400))
         u = w.usage

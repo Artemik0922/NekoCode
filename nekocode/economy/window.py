@@ -15,7 +15,7 @@ class ContextWindow:
         self.compressor = compressor or ContextCompressor(provider)
         self.provider = provider
 
-    def assemble(self, history, system_prompt, user_msg):
+    def assemble(self, history, system_prompt, user_msg, memory_block=None):
         if not self.budget or not self.budget.total:
             profile = ProviderProfile.profile_for(self.provider)
             self.budget = TokenBudget(**profile["budget"])
@@ -25,19 +25,24 @@ class ContextWindow:
         parts = []
         hot_files = compute_hotness(history)
 
-        # 1. System prompt — always full (expand budget if needed)
-        sys_tokens = self.counter.estimate(system_prompt)
-        budget_remaining = self.budget.available
-
+        # 1. System prompt — always full
         parts.append(("system", system_prompt))
-        budget_remaining -= sys_tokens
 
-        # 2. User message — always full
-        user_tokens = self.counter.estimate(user_msg)
+        # 2. Memory block — included with own budget, compressed if too large
+        if memory_block:
+            mem_tokens = self.counter.estimate(memory_block)
+            mem_budget = max(200, self.budget.system // 4)
+            if mem_tokens > mem_budget:
+                mem_compressed = self.compressor._trim(memory_block, int(mem_budget * self.counter.ratio))
+                parts.append(("memory", mem_compressed))
+            else:
+                parts.append(("memory", memory_block))
+
+        # 3. User message — always full
         parts.append(("user", user_msg))
-        budget_remaining -= user_tokens
 
-        # 3. History — score, sort, compress, pack
+        # 4. History — score, sort, compress, pack
+        history_budget = self.budget.history
         scored = []
         for idx, item in enumerate(history):
             s = self.scorer.score(item, idx, len(history), hot_files)
@@ -45,10 +50,8 @@ class ContextWindow:
 
         scored.sort(key=lambda x: -x[0])
 
-        history_budget = self.budget.history
         packed = []
         for score_val, idx, item in scored:
-
             compressed = self.compressor.compress(item, history_budget)
             tokens = self.counter.estimate(compressed)
 
@@ -62,7 +65,7 @@ class ContextWindow:
                     packed.append((score_val, idx, extreme))
                     history_budget -= ext_tokens
 
-        # 4. Sort back by original index for temporal coherence
+        # Sort back by original index for temporal coherence
         packed.sort(key=lambda x: x[1])
 
         omitted = len(history) - len(packed)
@@ -74,7 +77,6 @@ class ContextWindow:
         history_block = "\n".join(history_texts)
         parts.append(("history", history_block))
 
-        # 5. Assemble
         return "\n\n".join(content for _, content in parts)
 
     @property

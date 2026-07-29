@@ -335,11 +335,11 @@ class MiniAgent:
 
     def prompt(self, user_message):
         if self.economy_enabled:
-            full_system = f"{self.system_prompt}\n\n{self._memory_text()}"
             return self.context_window.assemble(
                 history=self.session["history"],
-                system_prompt=full_system,
+                system_prompt=self.system_prompt,
                 user_msg=user_message,
+                memory_block=self._memory_text(),
             )
         return "\n\n".join([
             self.system_prompt,
