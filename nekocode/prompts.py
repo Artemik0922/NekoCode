@@ -146,12 +146,17 @@ def build_env_section(workspace):
 # ── Git context ────────────────────────────────────────────────────
 def build_git_context(workspace):
     commits = "\n".join(f"  {c}" for c in workspace.recent_commits) or "  (none)"
+    diff_text = ""
+    if workspace.diff_unstaged:
+        diff_text = f"\nUnstaged diff (truncated):\n{workspace.diff_unstaged[:2000]}"
+    if workspace.diff_staged:
+        diff_text += f"\nStaged diff (truncated):\n{workspace.diff_staged[:2000]}"
     return f"""## Git state
 Status:
 {workspace.status}
 
 Recent commits:
-{commits}"""
+{commits}{diff_text}"""
 
 
 # ── Memory context ─────────────────────────────────────────────────
@@ -225,9 +230,37 @@ Parameters: slug (optional — loads specific memory), list (bool — list all m
 ### Skill
 Invoke a bundled skill. Available skills: verify (verify changes work), deep-research (web research report), code-review (review diff for bugs).
 Parameters: name (required), args (optional)
+
+### GitCommit
+Stage all changes and create a commit with a message.
+Parameters: message (required), add_all (bool, default True) — auto-stage all changes before committing
+
+### GitCreatePR
+Push current branch and create a GitHub Pull Request.
+Parameters: title (required), body (optional)
+
+### GitUndo
+Soft-reset the last commit (keeps changes staged). Equivalent to `git reset --soft HEAD~1`.
+Parameters: none
+
+### GitStatus
+Show working tree status. Equivalent to `git status --short`.
+Parameters: none
+
+### GitDiff
+Show unstaged or staged diff.
+Parameters: staged (bool, default False) — show staged diff instead of unstaged
 """
 
 # ── Compose full system prompt ─────────────────────────────────────
+def build_repo_map_section(workspace, max_lines=60):
+    from nekocode.repo_map import build_repo_map
+    text = build_repo_map(workspace.repo_root, max_lines=max_lines)
+    if text and text != "(empty)" and text != "(path not found)":
+        return f"## Codebase Map (repo-map)\n{text}\n\nThis map shows key symbols (classes, functions, methods) in your codebase. Use it to navigate and understand the project structure before reading files."
+    return ""
+
+
 def build_system_prompt(workspace, memory_store, agents_enabled=True, memory_enabled=True):
     sections = [
         SYSTEM_IDENTITY,
@@ -241,6 +274,10 @@ def build_system_prompt(workspace, memory_store, agents_enabled=True, memory_ena
         build_env_section(workspace),
         build_git_context(workspace),
     ]
+
+    repo_map_text = build_repo_map_section(workspace)
+    if repo_map_text:
+        sections.append(repo_map_text)
 
     if agents_enabled:
         sections.append("""## Agents

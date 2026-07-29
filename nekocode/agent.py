@@ -45,13 +45,15 @@ def clip(text, limit=MAX_TOOL_OUTPUT):
 
 # ── Workspace ──────────────────────────────────────────────────────
 class WorkspaceContext:
-    def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits):
+    def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, diff_unstaged="", diff_staged=""):
         self.cwd = cwd
         self.repo_root = repo_root
         self.branch = branch
         self.default_branch = default_branch
         self.status = status
         self.recent_commits = recent_commits
+        self.diff_unstaged = diff_unstaged
+        self.diff_staged = diff_staged
 
     @classmethod
     def build(cls, cwd):
@@ -67,6 +69,13 @@ class WorkspaceContext:
         repo_root = Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
         branch = git(["branch", "--show-current"]) or "-"
         default = git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], "origin/main")
+        def git_full(args, fallback=""):
+            try:
+                r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5)
+                return r.stdout.strip() if r.returncode == 0 else fallback
+            except Exception:
+                return fallback
+
         return cls(
             cwd=str(cwd),
             repo_root=str(repo_root),
@@ -74,6 +83,8 @@ class WorkspaceContext:
             default_branch=default.removeprefix("origin/"),
             status=clip(git(["status", "--short"], "clean") or "clean", 1500),
             recent_commits=[l for l in git(["log", "--oneline", "-5"]).splitlines() if l],
+            diff_unstaged=git(["diff"], ""),
+            diff_staged=git(["diff", "--cached"], ""),
         )
 
 
@@ -184,6 +195,9 @@ class FakeModelClient:
         if not self.outputs:
             raise RuntimeError("fake model ran out of outputs")
         return self.outputs.pop(0)
+
+    def stream(self, prompt, max_new_tokens):
+        yield self.complete(prompt, max_new_tokens)
 
 
 class OllamaModelClient:
@@ -303,6 +317,26 @@ class MiniAgent:
         }
         self.system_prompt = build_system_prompt(workspace, self.memory_store)
 
+        # Load custom system prompt from .claude/system-prompt.md (Claude Code compat)
+        custom_prompt_path = self.root / ".claude" / "system-prompt.md"
+        if custom_prompt_path.exists() and not self.config.get("skip_custom_prompt", False):
+            custom = custom_prompt_path.read_text(encoding="utf-8").strip()
+            if custom:
+                self.system_prompt += f"\n\n## Custom Instructions\n{custom}"
+
+        # Also check config for custom_instructions field
+        ci = self.config.get("custom_instructions", "") if self.config else ""
+        if ci:
+            self.system_prompt += f"\n\n## Custom Instructions\n{ci}"
+
+        # History/text caches
+        self._cached_history_text = None
+        self._cached_history_len = 0
+        self._auto_ctx_cache = None
+
+        # Architect mode
+        self.architect_mode = self.config.get("architect_mode", False)
+
         # Token economy
         economy_enabled = self.config.get("economy", {}).get("enabled", True) if self.config else True
         self.economy_enabled = economy_enabled
@@ -312,6 +346,41 @@ class MiniAgent:
         self.context_compressor = ContextCompressor(self._provider_name(), self.config.get("economy", {}).get("strategies") if self.config else None)
         self.context_window = ContextWindow(budget=self.token_budget, counter=self.token_counter, scorer=self.priority_scorer, compressor=self.context_compressor, provider=self._provider_name())
         self.token_tracker = TokenTracker()
+
+        # Architect mode overrides
+        if self.architect_mode:
+            self.system_prompt += """
+
+## ARCHITECT MODE — You are in architect mode and MUST follow ALL rules below:
+
+- DO NOT write, edit, or delete any code. You are strictly in a planning and design role.
+- You MAY use read-only tools (Read, Glob, Grep, GitStatus, GitDiff, web_fetch, web_search, Recall).
+- You MUST NOT call: Write, Edit, Bash, GitCommit, GitUndo, agent/delegate (use submit_blueprint instead).
+- Create blueprints with submit_blueprint before every non-trivial design decision.
+- When the user asks for implementation, respond with a detailed plan including:
+  - Files to create/modify
+  - Key design decisions and their rationale
+  - Potential risks and tradeoffs
+  - Recommended implementation order
+- Your output should be a complete blueprint or plan document.
+- If the user wants you to implement, ask them to exit architect mode with the /architect command."""
+
+        # MCP (Model Context Protocol)
+        self.mcp_manager = None
+        if self.config.get("mcp", {}).get("enabled", True):
+            from nekocode.mcp import MCPManager
+            self.mcp_manager = MCPManager(self)
+            self.mcp_manager.load_config()
+            if self.mcp_manager.servers and self.config.get("mcp", {}).get("auto_connect", True):
+                try:
+                    import asyncio
+                    results = asyncio.run(self.mcp_manager.connect_all())
+                    self.mcp_manager.register_tools()
+                    mcp_summary = self.mcp_manager.summary()
+                    if mcp_summary.strip() and "(no MCP" not in mcp_summary:
+                        self.system_prompt += f"\n\n## Connected MCP Servers\n{mcp_summary}"
+                except Exception as exc:
+                    pass
 
         self.session_path = self.session_store.save(self.session)
 
@@ -334,18 +403,21 @@ class MiniAgent:
                    memory_store=memory_store, session=session, **kwargs)
 
     def prompt(self, user_message):
+        auto_ctx = self._auto_ctx_cache or ""
         if self.economy_enabled:
             return self.context_window.assemble(
                 history=self.session["history"],
                 system_prompt=self.system_prompt,
                 user_msg=user_message,
                 memory_block=self._memory_text(),
+                auto_context=auto_ctx if auto_ctx else None,
             )
+        user_section = f"## Current user request\n{user_message}" + auto_ctx
         return "\n\n".join([
             self.system_prompt,
             self._memory_text(),
             "## Transcript\n" + self._history_text(),
-            f"## Current user request\n{user_message}",
+            user_section,
         ])
 
     def _memory_text(self):
@@ -364,6 +436,9 @@ class MiniAgent:
         hist = self.session["history"]
         if not hist:
             return "- empty"
+        if len(hist) == self._cached_history_len and self._cached_history_text is not None:
+            return self._cached_history_text
+
         lines = []
         seen_reads = set()
         recent_start = max(0, len(hist) - 6)
@@ -383,16 +458,35 @@ class MiniAgent:
             else:
                 limit = 900 if recent else 220
                 lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
-        return clip("\n".join(lines), MAX_HISTORY)
+        text = clip("\n".join(lines), MAX_HISTORY)
+        self._cached_history_text = text
+        self._cached_history_len = len(hist)
+        return text
 
     def record(self, item):
         self.session["history"].append(item)
-        self.session_path = self.session_store.save(self.session)
+        self._cached_history_text = None  # invalidate cache
+        hist_len = len(self.session["history"])
+        if hist_len <= 2 or hist_len % 5 == 0:
+            self.session_path = self.session_store.save(self.session)
 
     def ask(self, user_message):
         m = self.session["memory"]
         if not m["task"]:
             m["task"] = clip(user_message.strip(), 300)
+
+        # Cache auto_context once per ask() cycle
+        self._auto_ctx_cache = None
+        if self.config.get("auto_context", {}).get("enabled", True):
+            try:
+                from nekocode.auto_context import build_auto_context
+                max_files = int(self.config.get("auto_context", {}).get("max_files", 5))
+                max_chars = int(self.config.get("auto_context", {}).get("max_chars", 3000))
+                ctx = build_auto_context(user_message, self.root, max_files=max_files, max_chars=max_chars)
+                if ctx:
+                    self._auto_ctx_cache = "\n\n" + ctx
+            except Exception:
+                pass
 
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
@@ -434,13 +528,94 @@ class MiniAgent:
                 self.token_tracker.record_response(final, self.token_counter)
                 self.token_tracker.end_step()
             self.record({"role": "assistant", "content": final, "created_at": now()})
+            self.session_store.save(self.session)
+            self._auto_ctx_cache = None
             return final
 
         msg = "Stopped: max steps reached without final answer."
         if attempts >= max_att and tool_steps < self.max_steps:
             msg = "Stopped: too many invalid model responses."
         self.record({"role": "assistant", "content": msg, "created_at": now()})
+        self.session_store.save(self.session)
+        self._auto_ctx_cache = None
         return msg
+
+    def ask_stream(self, user_message):
+        """Like ask() but yields final response tokens one by one (streaming)."""
+        m = self.session["memory"]
+        if not m["task"]:
+            m["task"] = clip(user_message.strip(), 300)
+
+        self._auto_ctx_cache = None
+        if self.config.get("auto_context", {}).get("enabled", True):
+            try:
+                from nekocode.auto_context import build_auto_context
+                max_files = int(self.config.get("auto_context", {}).get("max_files", 5))
+                max_chars = int(self.config.get("auto_context", {}).get("max_chars", 3000))
+                ctx = build_auto_context(user_message, self.root, max_files=max_files, max_chars=max_chars)
+                if ctx:
+                    self._auto_ctx_cache = "\n\n" + ctx
+            except Exception:
+                pass
+
+        self.record({"role": "user", "content": user_message, "created_at": now()})
+
+        tool_steps = 0
+        attempts = 0
+        max_att = max(self.max_steps * 3, self.max_steps + 4)
+
+        while tool_steps < self.max_steps and attempts < max_att:
+            attempts += 1
+            prompt_text = self.prompt(user_message)
+
+            # Stream from provider while detecting tool calls
+            stream_iter = self.model_client.stream(prompt_text, self.max_new_tokens)
+            prelude = []
+            is_tool_call = None
+            full_text = ""
+
+            for chunk in stream_iter:
+                full_text += chunk
+                if is_tool_call is None:
+                    prelude.append(chunk)
+                    stripped = "".join(prelude).lstrip()
+                    if len(stripped) >= 6:
+                        if stripped.startswith("<tool"):
+                            is_tool_call = True
+                        else:
+                            is_tool_call = False
+                            for p in prelude:
+                                yield p
+                            prelude = None
+                elif prelude is None:
+                    yield chunk
+
+            # Handle result based on detection
+            if is_tool_call:
+                kind, payload = self._parse(full_text)
+                if kind == "tool":
+                    tool_steps += 1
+                    name = payload.get("name", "")
+                    args = payload.get("args", {})
+                    result = self._run_tool(name, args)
+                    self.record({"role": "tool", "name": name, "args": args, "content": result, "created_at": now()})
+                    self._note_tool(name, args, result)
+                    continue
+                # fell through: started with <tool but wasn't a valid tool call
+                yield full_text
+
+            self.record({"role": "assistant", "content": full_text, "created_at": now()})
+            self.session_store.save(self.session)
+            self._auto_ctx_cache = None
+            return
+
+        msg = "Stopped: max steps reached without final answer."
+        if attempts >= max_att and tool_steps < self.max_steps:
+            msg = "Stopped: too many invalid model responses."
+        self.record({"role": "assistant", "content": msg, "created_at": now()})
+        self.session_store.save(self.session)
+        self._auto_ctx_cache = None
+        yield msg
 
     def _note_tool(self, name, args, result):
         m = self.session["memory"]
@@ -470,6 +645,11 @@ class MiniAgent:
             return fn
         return dec
 
+    @classmethod
+    def register_tool(cls, name, fn, risky=False, schema=None):
+        """Register a tool at runtime (e.g. from MCP servers)."""
+        cls.TOOL_REGISTRY[name] = {"fn": fn, "risky": risky, "schema": schema or {}}
+
     def _run_tool(self, name, args):
         entry = self.TOOL_REGISTRY.get(name)
         if entry is None:
@@ -478,6 +658,9 @@ class MiniAgent:
             self._validate(name, args)
         except Exception as exc:
             return f"error: invalid args for {name}: {exc}"
+
+        if self.architect_mode and name in ("write", "edit", "bash", "git_commit", "git_undo", "agent", "delegate"):
+            return f"error: tool '{name}' is disabled in architect mode (use only read-only tools)"
 
         if self._repeated_call(name, args):
             return f"error: repeated identical call to {name}; choose a different tool or return a final answer"
@@ -586,6 +769,14 @@ class MiniAgent:
         elif name == "skill":
             if not str(args.get("name", "")).strip():
                 raise ValueError("name must not be empty")
+        elif name == "git_commit":
+            if not str(args.get("message", "")).strip():
+                raise ValueError("message must not be empty")
+        elif name == "git_create_pr":
+            if not str(args.get("title", "")).strip():
+                raise ValueError("title must not be empty")
+        elif name in ("git_undo", "git_status", "git_diff"):
+            pass
 
     def _approve(self, name, args):
         if self.read_only:
@@ -711,6 +902,9 @@ class MiniAgent:
         self.session["memory"] = {"task": "", "files": [], "notes": [], "blueprints": [], "tasks": []}
         self.task_manager = TaskManager()
         self.token_tracker.reset()
+        self._cached_history_text = None
+        self._cached_history_len = 0
+        self._auto_ctx_cache = None
         self.session_store.save(self.session)
 
     def tokens_dashboard(self):
@@ -925,6 +1119,65 @@ def tool_skill(agent, args):
     return f"# Skill: {name}\n\n{skill['content']}"
 
 
+def _git(agent, *args):
+    r = subprocess.run(["git", *args], cwd=agent.root, capture_output=True, text=True, timeout=15)
+    return r
+
+
+def tool_git_commit(agent, args):
+    msg = str(args["message"]).strip()
+    add_all = args.get("add_all", True)
+    if add_all:
+        _git(agent, "add", "-A")
+    r = _git(agent, "commit", "-m", msg)
+    if r.returncode != 0:
+        return f"commit failed:\n{r.stderr.strip()}"
+    return f"committed: {msg}\n{r.stdout.strip()}"
+
+
+def tool_git_create_pr(agent, args):
+    title = str(args["title"]).strip()
+    body = str(args.get("body", "")).strip()
+    r = _git(agent, "push", "origin", "HEAD")
+    if r.returncode != 0:
+        return f"push failed:\n{r.stderr.strip()}"
+    if shutil.which("gh"):
+        cmd = ["gh", "pr", "create", "--title", title]
+        if body:
+            cmd += ["--body", body]
+        r2 = subprocess.run(cmd, cwd=agent.root, capture_output=True, text=True, timeout=15)
+        if r2.returncode == 0:
+            return f"PR created: {r2.stdout.strip()}"
+        return f"push ok, but gh failed:\n{r2.stderr.strip()}"
+    return f"push ok. Install gh CLI to create PRs, then create a PR with title: {title}"
+
+
+def tool_git_undo(agent, args):
+    r = _git(agent, "log", "--oneline", "-2")
+    commits = [l for l in r.stdout.strip().splitlines() if l]
+    if not commits:
+        return "no commits to undo"
+    r2 = _git(agent, "reset", "--soft", "HEAD~1")
+    if r2.returncode != 0:
+        return f"undo failed:\n{r2.stderr.strip()}"
+    return f"undone: {commits[0]}"
+
+
+def tool_git_status(agent, args):
+    r = _git(agent, "status", "--short")
+    return r.stdout.strip() or "(clean)"
+
+
+def tool_git_diff(agent, args):
+    staged = args.get("staged", False)
+    cmd = ["git", "diff"] if not staged else ["git", "diff", "--cached"]
+    r = subprocess.run(cmd, cwd=agent.root, capture_output=True, text=True, timeout=15)
+    out = r.stdout.strip()
+    if not out:
+        return "(no diff)"
+    return clip(out, 4000)
+
+
 # Register tools ────────────────────────────────────────────────────
 _RI = MiniAgent.register
 _RI("read", False, {"path": "str", "offset": "int=1", "limit": "int=200"})(tool_read)
@@ -945,6 +1198,11 @@ _RI("recall", False, {"slug": "str=''", "list": "bool=False"})(tool_recall)
 _RI("web_fetch", False, {"url": "str"})(tool_web_fetch)
 _RI("web_search", False, {"query": "str"})(tool_web_search)
 _RI("skill", False, {"name": "str", "args": "str=''"})(tool_skill)
+_RI("git_commit", True, {"message": "str", "add_all": "bool=True"})(tool_git_commit)
+_RI("git_create_pr", True, {"title": "str", "body": "str=''"})(tool_git_create_pr)
+_RI("git_undo", True, {})(tool_git_undo)
+_RI("git_status", False, {})(tool_git_status)
+_RI("git_diff", False, {"staged": "bool=False"})(tool_git_diff)
 # Backward compat aliases
 _RI("read_file", False, {"path": "str", "offset": "int=1", "limit": "int=200"})(tool_read)
 _RI("write_file", True, {"path": "str", "content": "str"})(tool_write)

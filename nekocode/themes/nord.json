@@ -1,0 +1,16 @@
+{
+  "primary": "#88C0D0",
+  "secondary": "#81A1C1",
+  "accent": "#B48EAD",
+  "background": "#2E3440",
+  "panel_bg": "#3B4252",
+  "element_bg": "#434C5E",
+  "border": "#4C566A",
+  "border_active": "#616E88",
+  "border_subtle": "#3B4252",
+  "text": "#ECEFF4",
+  "text_muted": "#7B88A1",
+  "success": "#A3BE8C",
+  "error": "#BF616A",
+  "warning": "#EBCB8B"
+}

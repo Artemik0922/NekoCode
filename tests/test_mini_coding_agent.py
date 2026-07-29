@@ -241,7 +241,6 @@ def test_welcome_screen_contains_title_and_info(tmp_path):
     output = buf.getvalue()
 
     assert "NEKOCODE" in output
-    assert "⡆⣐⢕⢕" in output
 
 
 def test_prompt_top_level_sections_stay_flush_left_with_multiline_content(tmp_path):

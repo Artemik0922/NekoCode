@@ -14,8 +14,14 @@ class ContextWindow:
         self.scorer = scorer or PriorityScorer()
         self.compressor = compressor or ContextCompressor(provider)
         self.provider = provider
+        self._cache_key = None
+        self._cache_result = None
 
-    def assemble(self, history, system_prompt, user_msg, memory_block=None):
+    def assemble(self, history, system_prompt, user_msg, memory_block=None, auto_context=None):
+        # Fast path: cached result for unchanged history
+        current_key = (len(history), system_prompt, user_msg, memory_block, auto_context)
+        if current_key == self._cache_key and self._cache_result is not None:
+            return self._cache_result
         if not self.budget or not self.budget.total:
             profile = ProviderProfile.profile_for(self.provider)
             self.budget = TokenBudget(**profile["budget"])
@@ -38,8 +44,11 @@ class ContextWindow:
             else:
                 parts.append(("memory", memory_block))
 
-        # 3. User message — always full
-        parts.append(("user", user_msg))
+        # 3. User message — always full (with optional auto-context)
+        user_content = user_msg
+        if auto_context:
+            user_content = user_msg + "\n\n" + auto_context
+        parts.append(("user", user_content))
 
         # 4. History — score, sort, compress, pack
         history_budget = self.budget.history
@@ -77,7 +86,10 @@ class ContextWindow:
         history_block = "\n".join(history_texts)
         parts.append(("history", history_block))
 
-        return "\n\n".join(content for _, content in parts)
+        result = "\n\n".join(content for _, content in parts)
+        self._cache_key = current_key
+        self._cache_result = result
+        return result
 
     @property
     def usage(self):

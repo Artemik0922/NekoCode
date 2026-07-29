@@ -1,15 +1,44 @@
-"""NekoCode CLI — rich terminal UI with Russian locale, cat art, slash commands."""
+"""NekoCode CLI — custom TUI console with Rich."""
 
 import argparse
+import io
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
+
+# ── Windows console setup ─────────────────────────────────────────
+def _setup_console():
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-11)
+        m = ctypes.c_uint32()
+        k32.GetConsoleMode(h, ctypes.byref(m))
+        m.value |= 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        k32.SetConsoleMode(h, m)
+        k32.SetConsoleOutputCP(65001)
+        k32.SetConsoleCP(65001)
+        k32.SetConsoleTitleW("NekoCode")
+    except Exception:
+        pass
+    try:
+        sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+# ───────────────────────────────────────────────────────────────────
 
 from rich import box
 from rich.align import Align
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
@@ -19,24 +48,23 @@ from nekocode.agent import (
 )
 from nekocode.config import Config
 from nekocode.providers import create_provider_from_config
+from nekocode.theme import MIMO_THEME, Theme, list_themes, load_theme
 
-console = Console()
+console = Console(force_terminal=sys.stdout.isatty())
+
+SESSION_START = datetime.now()
 
 CAT_ART = (
-    "⡆⣐⢕⢕⢕⢕⢕⢕⢕⢕⠅⢗⢕⢕⢕⢕⢕⢕⢕⠕⠕⢕⢕⢕⢕⢕⢕⢕⢕⢕\n"
-    "⢐⢕⢕⢕⢕⢕⣕⢕⢕⠕⠁⢕⢕⢕⢕⢕⢕⢕⢕⠅⡄⢕⢕⢕⢕⢕⢕⢕⢕⢕\n"
-    "⢕⢕⢕⢕⢕⠅⢗⢕⠕⣠⠄⣗⢕⢕⠕⢕⢕⢕⠕⢠⣿⠐⢕⢕⢕⠑⢕⢕⠵⢕\n"
-    "⢕⢕⢕⢕⠁⢜⠕⢁⣴⣿⡇⢓⢕⢵⢐⢕⢕⠕⢁⣾⢿⣧⠑⢕⢕⠄⢑⢕⠅⢕\n"
-    "⢕⢕⠵⢁⠔⢁⣤⣤⣶⣶⣶⡐⣕⢽⠐⢕⠕⣡⣾⣶⣶⣶⣤⡁⢓⢕⠄⢑⢅⢑\n"
-    "⠍⣧⠄⣶⣾⣿⣿⣿⣿⣿⣿⣷⣔⢕⢄⢡⣾⣿⣿⣿⣿⣿⣿⣿⣦⡑⢕⢤⠱⢐\n"
-    "⢠⢕⠅⣾⣿⠋⢿⣿⣿⣿⠉⣿⣿⣷⣦⣶⣽⣿⣿⠈⣿⣿⣿⣿⠏⢹⣷⣷⡅⢐\n"
-    "⣔⢕⢥⢻⣿⡀⠈⠛⠛⠁⢠⣿⣿⣿⣿⣿⣿⣿⣿⡀⠈⠛⠛⠁⠄⣼⣿⣿⡇⢔\n"
-    "⢕⢕⢽⢸⢟⢟⢖⢖⢤⣶⡟⢻⣿⡿⠻⣿⣿⡟⢀⣿⣦⢤⢤⢔⢞⢿⢿⣿⠁⢕\n"
-    "⢕⢕⠅⣐⢕⢕⢕⢕⢕⣿⣿⡄⠛⢀⣦⠈⠛⢁⣼⣿⢗⢕⢕⢕⢕⢕⢕⡏⣘⢕\n"
-    "⢕⢕⠅⢓⣕⣕⣕⣕⣵⣿⣿⣿⣾⣿⣿⣿⣿⣿⣿⣿⣷⣕⢕⢕⢕⢕⡵⢀⢕⢕\n"
-    "⢑⢕⠃⡈⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢃⢕⢕⢕\n"
-    "⣆⢕⠄⢱⣄⠛⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⢁⢕⢕⠕⢁\n"
-    "⣿⣦⡀⣿⣿⣷⣶⣬⣍⣛⣛⣛⡛⠿⠿⠿⠛⠛⢛⣛⣉⣭⣤⣂⢜⠕⢑⣡⣴⣿"
+    "          /\\__/\\\n"
+    "         /  w  \\\n"
+    "        /  O O  \\\n"
+    "       /  __^__  \\\n"
+    "      /  (=====)  \\\n"
+    "     /  (=====)    \\\n"
+    "    /  (=====)       \\\n"
+    "   /  (=====)   _     \\\n"
+    "  /  (=====)  ( )      \\\n"
+    " /__(=====)__(___)______\\"
 )
 
 
@@ -48,39 +76,135 @@ def middle(text, width):
     return text[:half] + "..." + text[-half:]
 
 
-def build_welcome(agent, model, provider_name):
-    debt_count = len(TechDebtLedger.entries(agent.root))
-    bp_count = len(BlueprintStore.list_all(agent.root))
-    mem_count = len(agent.memory_store.list_all())
+def build_header(agent, provider_name, model_name, theme=MIMO_THEME):
+    """Status bar — always at top."""
+    from nekocode import __version__
+    eco = "⏣" if agent.economy_enabled else "⏥"
+    mode = "🏛" if agent.architect_mode else "⚡"
+    hist_len = len(agent.session.get("history", [])) if agent.session else 0
+    branch = agent.workspace.branch
+    return Panel(
+        Text.assemble(
+            (" 🐱 ", ""),
+            ("NekoCode", Style(color=theme.primary, bold=True)),
+            (f" v{__version__}", Style(color=theme.text_muted)),
+            (" │ ", Style(color=theme.border)),
+            ("🤖 ", ""),
+            (f"{provider_name}/{model_name}", Style(color=theme.text)),
+            (" │ ", Style(color=theme.border)),
+            (f"🌿 {branch}", Style(color=theme.text_muted)),
+            (" │ ", Style(color=theme.border)),
+            (eco, Style(color=theme.warning if agent.economy_enabled else theme.text_muted)),
+            (" │ ", Style(color=theme.border)),
+            (mode, ""),
+            (" │ ", Style(color=theme.border)),
+            (f"📝 {hist_len}", Style(color=theme.text_muted)),
+        ),
+        box=box.HORIZONTALS,
+        border_style=theme.border,
+        padding=(0, 1),
+        style=Style(bgcolor=theme.panel_bg),
+    )
 
-    info = Table.grid(padding=(0, 2))
-    info.add_column(style="bold")
-    info.add_column()
-    info.add_column(style="bold")
-    info.add_column()
-    info.add_row("Директория", f"[cyan]{middle(agent.workspace.cwd, 40)}[/]",
-                 "Модель", f"[green]{model}[/]")
-    info.add_row("Ветка", f"[magenta]{agent.workspace.branch}[/]",
-                 "Провайдер", f"[yellow]{provider_name}[/]")
-    info.add_row("Подтвержд.", f"[bold]{agent.approval_policy}[/]", "Шаги", f"[cyan]{agent.max_steps}[/]")
 
-    stats = Table.grid(padding=(0, 2))
-    stats.add_column()
-    stats.add_column()
-    stats.add_column()
-    stats.add_row(f"[bold yellow]Долг:[/] {debt_count}",
-                  f"[bold blue]Блюпринтов:[/] {bp_count}",
-                  f"[bold green]Воспоминаний:[/] {mem_count}")
+def build_footer(agent, theme=MIMO_THEME):
+    """Status bar at the bottom."""
+    cwd = middle(os.path.basename(os.path.abspath(agent.root)), 40)
+    session_id = agent.session["id"][:8] if agent.session else "-"
+    mcp_count = len(agent.mcp_manager.servers) if agent.mcp_manager else 0
+    parts = [
+        (f" 📁 {cwd}", Style(color=theme.text_muted)),
+        (" │ ", Style(color=theme.border_subtle)),
+        (f"💾 {session_id}", Style(color=theme.text_muted)),
+    ]
+    if mcp_count:
+        parts += [
+            (" │ ", Style(color=theme.border_subtle)),
+            (f"⊙ {mcp_count}", Style(color=theme.success)),
+        ]
+    return Text.assemble(*parts)
 
-    cat = Text(CAT_ART, style="bright_yellow")
-    title = Text(f"NEKOCODE v0.5", style="bold white on blue", no_wrap=True)
-    layout = Panel(
-        Align.center(Text.assemble(cat, "\n\n", title), vertical="middle"),
+
+def render_message(msg, theme=MIMO_THEME):
+    """Render a chat message as a styled block."""
+    cached = msg.get("_rendered")
+    if cached is not None:
+        return cached
+    if msg["role"] == "user":
+        panel = Panel(
+            Markdown(msg["content"]),
+            title=Text.assemble((" Вы ", Style(color=theme.text, bold=True))),
+            border_style=theme.primary,
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+    elif msg["role"] == "assistant":
+        panel = Panel(
+            Markdown(msg["content"]),
+            title=Text.assemble((" NekoCode ", Style(color=theme.accent, bold=True))),
+            border_style=theme.accent,
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+    elif msg["role"] == "tool":
+        t = msg.get("name", "?")
+        a = msg.get("args", {})
+        c = msg.get("content", "")[:200]
+        panel = Panel(
+            Text.assemble(
+                (f" {t} ", Style(color=theme.text_muted, bold=True)),
+                (f"{a}", Style(color=theme.text_muted)),
+                "\n",
+                (c[:200], Style(color=theme.text_muted, dim=True)),
+            ),
+            border_style=theme.border,
+            box=box.SQUARE,
+            padding=(0, 1),
+        )
+    else:
+        panel = Text("")
+    msg["_rendered"] = panel
+    return panel
+
+
+def build_messages(agent, max_messages=10, theme=MIMO_THEME):
+    """Render recent conversation."""
+    hist = agent.session.get("history", [])
+    if not hist:
+        return Panel(
+            Align.center(Text.assemble(("Начните диалог...", Style(color=theme.text_muted)))),
+            border_style=theme.border,
+            box=box.ROUNDED,
+        )
+    recent = hist[-max_messages:]
+    return Group(*[render_message(m, theme) for m in recent])
+
+
+def build_welcome(agent, model, provider_name, theme=MIMO_THEME):
+    from nekocode import __version__
+    cat = Text(CAT_ART, style=Style(color=theme.primary, bold=True))
+    title = Text("NEKOCODE", style=Style(color=theme.primary, bold=True))
+    version = Text(f"v{__version__}", style=Style(color=theme.text_muted))
+    eco_label = "включена" if agent.economy_enabled else "выключена"
+    eco_st = theme.text if agent.economy_enabled else theme.text_muted
+    mode_label = "архитектор" if agent.architect_mode else "нормальный"
+    mode_st = theme.warning if agent.architect_mode else theme.text
+    info = Text.assemble(
+        ("\n", ""),
+        (f"Провайдер: {provider_name}  ", Style(color=theme.secondary)),
+        (f"Модель: {model}  ", Style(color=theme.text)),
+        (f"Ветка: {agent.workspace.branch}  ", Style(color=theme.text_muted)),
+        ("\n", ""),
+        ("Экономия: ", Style(color=theme.text_muted)), (eco_label, Style(color=eco_st)),
+        ("  Режим: ", Style(color=theme.text_muted)), (mode_label, Style(color=mode_st)),
+        ("  Шаги: ", Style(color=theme.text_muted)), (f"{agent.max_steps}", Style(color=theme.accent)),
+    )
+    return Panel(
+        Align.center(Text.assemble(cat, "\n\n", title, "  ", version, "\n", info), vertical="middle"),
         box=box.DOUBLE_EDGE,
-        border_style="bright_blue",
+        border_style=theme.primary,
         padding=(1, 2),
     )
-    return layout
 
 
 def show_help():
@@ -103,6 +227,10 @@ def show_help():
   [bold]/economy[/] on|off|profile Вкл/выкл экономию, показать профиль
   [bold]/reset[/]      Сбросить сессию
   [bold]/exit[/]       Выйти
+  [bold]/undo[/]       Откатить последний коммит
+  [bold]/mcp[/]        Список подключённых MCP серверов
+  [bold]/architect[/]  Переключить режим архитектора (plan only)
+  [bold]/commit[/]     Создать коммит (staged changes)
 
 [bold]Провайдеры:[/] ollama (по умолч.), openai, anthropic, google, custom
   Настройка: [italic]nekocode.json[/] в корне проекта или ~/.config/nekocode/config.json
@@ -325,7 +453,7 @@ def build_arg_parser():
     parser.add_argument("--cwd", default=".", help="Рабочая директория.")
     parser.add_argument("--config", default=None, help="Путь к nekocode.json.")
     parser.add_argument("--model", default=None, help="Модель (переопределяет конфиг).")
-    parser.add_argument("--provider", default=None, choices=["ollama", "openai", "anthropic", "google", "custom"],
+    parser.add_argument("--provider", default=None, choices=["ollama", "openai", "anthropic", "google", "custom", "routerai"],
                         help="Провайдер LLM.")
     parser.add_argument("--host", default=None, help="URL провайдера (Ollama / OpenAI-compat).")
     parser.add_argument("--ollama-timeout", type=int, default=None, help="Таймаут к Ollama (сек).")
@@ -349,8 +477,11 @@ def build_agent(args):
         "top_p": args.top_p,
     })
     # Override provider model/host from CLI
-    if args.model and cfg.get("providers", {}).get(cfg.get("provider", "ollama")):
-        cfg.data["providers"][cfg["provider"]]["model"] = args.model
+    if args.model:
+        prov_name = cfg.get("provider", "ollama")
+        if prov_name not in cfg.data.get("providers", {}):
+            cfg.data.setdefault("providers", {})[prov_name] = {}
+        cfg.data["providers"][prov_name]["model"] = args.model
     if args.host and cfg.get("providers", {}).get(cfg.get("provider", "ollama")):
         cfg.data["providers"][cfg["provider"]]["host"] = args.host
     if args.ollama_timeout and cfg.get("providers", {}).get("ollama"):
@@ -380,27 +511,49 @@ def build_agent(args):
 
 
 def main(argv=None):
+    _setup_console()
     args = build_arg_parser().parse_args(argv)
     agent, cfg = build_agent(args)
     provider_name = cfg.get("provider", "ollama")
     model_name = cfg.active_provider.get("model", "?")
 
-    console.print()
-    console.print(build_welcome(agent, model=model_name, provider_name=provider_name))
-    console.print()
-
     if args.prompt:
         prompt = " ".join(args.prompt).strip()
         if prompt:
             response = agent.ask(prompt)
-            console.print(Panel(Markdown(response), title="Ответ", border_style="green", box=box.ROUNDED))
+            print(response)
         return 0
 
+    theme_name = cfg.get("theme", "mimocode")
+    theme = load_theme(theme_name)
+
+    console.clear()
+    console.print(build_welcome(agent, model_name, provider_name, theme))
+    input(Text.assemble(("\n  Нажмите Enter чтобы начать...  ", Style(color=theme.text_muted))))
+
+    rendered_count = 0
+    first_chat_layout = True
+
     while True:
+        if first_chat_layout:
+            console.clear()
+            console.print(build_header(agent, provider_name, model_name, theme))
+            first_chat_layout = False
+            rendered_count = 0
+
+        hist = agent.session.get("history", [])
+        for m in hist[rendered_count:]:
+            console.print(render_message(m, theme))
+        rendered_count = len(hist)
+
+        console.print(build_footer(agent, theme))
+        print()
+
         try:
-            user_input = Prompt.ask("\n[bold bright_blue]❯[/] [bold]nekocode[/]")
+            user_input = input("\033[38;2;255;106;0m❯\033[0m ")
         except (EOFError, KeyboardInterrupt):
-            console.print("\n[yellow]До свидания![/]")
+            print()
+            console.print(Panel("[yellow]До свидания![/]", border_style=theme.warning, box=box.ROUNDED))
             return 0
 
         if not user_input:
@@ -409,68 +562,118 @@ def main(argv=None):
         cmd = user_input.split()
         base = cmd[0] if cmd else ""
 
+        def _show_screen(content, title=None):
+            console.clear()
+            console.print(build_header(agent, provider_name, model_name, theme))
+            if title:
+                console.print(Panel(content, title=title, border_style=theme.accent, box=box.ROUNDED))
+            else:
+                console.print(content)
+            console.print(build_footer(agent, theme))
+            input(Text.assemble(("\n  Нажмите Enter...  ", Style(color=theme.text_muted))))
+            nonlocal first_chat_layout
+            first_chat_layout = True
+
         if base in ("/exit", "/quit"):
-            console.print("[yellow]До свидания![/]")
+            console.print(Panel("[yellow]До свидания![/]", border_style=theme.warning, box=box.ROUNDED))
             return 0
         if base == "/help":
-            console.print(show_help())
+            _show_screen(show_help())
             continue
         if base == "/memory":
-            console.print(show_memory(agent))
+            _show_screen(show_memory(agent))
             continue
         if base == "/session":
-            console.print(f"[dim]Сессия:[/] [cyan]{agent.session_path}[/]")
+            _show_screen(Panel(f"[dim]Сессия:[/] {agent.session_path}", border_style=theme.border, box=box.ROUNDED))
             continue
         if base == "/blueprints":
-            console.print(show_blueprints(agent))
+            _show_screen(show_blueprints(agent))
             continue
         if base == "/audit":
-            console.print(audit_tech_debt(agent))
+            _show_screen(audit_tech_debt(agent))
             continue
         if base == "/recall":
-            console.print(show_persistent_memory(agent))
+            _show_screen(show_persistent_memory(agent))
             continue
         if base == "/task":
-            console.print(show_tasks(agent))
+            _show_screen(show_tasks(agent))
             continue
         if base == "/skills":
-            console.print(show_skills(agent))
+            _show_screen(show_skills(agent))
             continue
         if base == "/config":
-            console.print(show_config(agent, cfg))
+            _show_screen(show_config(agent, cfg))
             continue
         if base == "/providers":
-            console.print(show_providers(agent, cfg))
+            _show_screen(show_providers(agent, cfg))
             continue
         if base == "/tokens":
-            console.print(agent.tokens_dashboard())
+            _show_screen(agent.tokens_dashboard())
+            continue
+        if base == "/theme":
+            available = list_themes()
+            if len(cmd) >= 2:
+                name = cmd[1]
+                if name in available:
+                    theme = load_theme(name)
+                    theme_name = name
+                    cfg.set("theme", name)
+                    cfg.save()
+                    _show_screen(Panel(f"Тема: {name}", border_style=theme.success, box=box.ROUNDED))
+                else:
+                    avail_str = ", ".join(available)
+                    _show_screen(Panel(f"Тема '{name}' не найдена.\nДоступны: {avail_str}", border_style=theme.error, box=box.ROUNDED))
+            else:
+                avail_str = ", ".join(available)
+                _show_screen(Panel(f"Текущая: {theme_name}\nДоступны: {avail_str}\n\n/theme <имя>", border_style=theme.accent, box=box.ROUNDED))
             continue
         if base == "/economy":
             if len(cmd) >= 2 and cmd[1] == "on":
                 agent.economy_enabled = True
-                console.print("[green]Экономия токенов включена.[/]")
             elif len(cmd) >= 2 and cmd[1] == "off":
                 agent.economy_enabled = False
-                console.print("[yellow]Экономия токенов выключена.[/]")
             elif len(cmd) >= 2 and cmd[1] == "profile":
                 budget = agent.token_budget
                 lines = [
-                    f"[bold]Профиль:[/] {agent._provider_name()}",
-                    f"[bold]Общий бюджет:[/] {budget.total:,} токенов",
-                    f"[bold]System:[/] {budget.system:,}",
-                    f"[bold]User msg:[/] {budget.user_msg:,}",
-                    f"[bold]History:[/] {budget.history:,}",
-                    f"[bold]Reserve:[/] {budget.reserve:,}",
-                    f"[bold]Статус:[/] {'[green]включена[/]' if agent.economy_enabled else '[red]выключена[/]'}",
+                    f"Профиль: {agent._provider_name()}",
+                    f"Общий бюджет: {budget.total:,} токенов",
+                    f"System: {budget.system:,}",
+                    f"User msg: {budget.user_msg:,}",
+                    f"History: {budget.history:,}",
+                    f"Reserve: {budget.reserve:,}",
+                    f"Статус: {'включена' if agent.economy_enabled else 'выключена'}",
                 ]
-                console.print(Panel("\n".join(lines), title="Token Economy", border_style="bright_cyan", box=box.ROUNDED))
+                _show_screen(Panel("\n".join(lines), title="Token Economy", border_style=theme.accent, box=box.ROUNDED))
             else:
                 status = "включена" if agent.economy_enabled else "выключена"
-                console.print(f"[bold]Экономия:[/] {status}. [dim]/economy on|off|profile[/]")
+                _show_screen(Panel(f"Экономия: {status}. /economy on|off|profile", border_style=theme.border, box=box.ROUNDED))
+            continue
+        if base == "/undo":
+            from nekocode.agent import tool_git_undo
+            result = tool_git_undo(agent, {})
+            _show_screen(Panel(result, border_style=theme.warning, box=box.ROUNDED))
+            continue
+        if base == "/architect":
+            agent.architect_mode = not agent.architect_mode
+            status = "включён" if agent.architect_mode else "выключен"
+            _show_screen(Panel(f"Architect mode {status}", border_style=theme.accent, box=box.ROUNDED))
+            continue
+        if base == "/mcp":
+            if agent.mcp_manager:
+                _show_screen(Panel(agent.mcp_manager.summary(), title="MCP Servers", border_style=theme.accent, box=box.ROUNDED))
+            else:
+                _show_screen(Panel("MCP не настроен", border_style=theme.warning, box=box.ROUNDED))
+            continue
+        if base == "/commit":
+            import subprocess
+            r = subprocess.run(["git", "diff", "--cached"], cwd=agent.root, capture_output=True, text=True, timeout=5)
+            if not r.stdout.strip():
+                _show_screen(Panel("Нет застейдженных изменений. Добавьте файлы через git add.", border_style=theme.warning, box=box.ROUNDED))
+            else:
+                _show_screen(Panel("Застейдженные файлы готовы к коммиту. Используйте git_commit в диалоге с агентом.", border_style=theme.success, box=box.ROUNDED))
             continue
         if base == "/reset":
             agent.reset()
-            console.print("[yellow]Сессия сброшена.[/]")
             continue
         if base == "/provider" and len(cmd) >= 2:
             new_provider = cmd[1]
@@ -481,9 +684,11 @@ def main(argv=None):
                 model_name2 = pdata.get("model", "?")
                 from nekocode.providers import create_provider_from_config
                 agent.model_client = create_provider_from_config(cfg.data)
-                console.print(f"[green]Провайдер: {old} → {new_provider} (модель: {model_name2})[/]")
+                provider_name = new_provider
+                model_name = model_name2
+                _show_screen(Panel(f"Провайдер: {old} → {new_provider} (модель: {model_name2})", border_style=theme.success, box=box.ROUNDED))
             else:
-                console.print(f"[red]Неизвестный провайдер: {new_provider}[/]")
+                _show_screen(Panel(f"Неизвестный провайдер: {new_provider}", border_style=theme.error, box=box.ROUNDED))
             continue
         if base == "/model" and len(cmd) >= 2:
             new_model = cmd[1]
@@ -493,18 +698,35 @@ def main(argv=None):
                 from nekocode.providers import create_provider_from_config
                 agent.model_client = create_provider_from_config(cfg.data)
                 agent.max_new_tokens = int(cfg.get("max_new_tokens", 1024))
-                console.print(f"[green]Модель: {new_model}[/]")
+                model_name = new_model
+                _show_screen(Panel(f"Модель: {new_model}", border_style=theme.success, box=box.ROUNDED))
             else:
-                console.print(f"[red]Не удалось сменить модель для {pname}[/]")
+                _show_screen(Panel(f"Не удалось сменить модель для {pname}", border_style=theme.error, box=box.ROUNDED))
             continue
         if base == "/resolve" and len(cmd) >= 2:
             try:
                 idx = int(cmd[1])
                 result = TechDebtLedger.resolve(agent.root, idx)
-                console.print(Panel(f"[green]{result}[/]", border_style="green", box=box.ROUNDED))
+                _show_screen(Panel(result, border_style=theme.success, box=box.ROUNDED))
             except (ValueError, IndexError):
-                console.print("[red]Использование: /resolve <номер_записи>[/]")
+                _show_screen(Panel("Использование: /resolve <номер_записи>", border_style=theme.error, box=box.ROUNDED))
             continue
 
-        response = agent.ask(user_input)
-        console.print(Panel(Markdown(response), title="Ответ", border_style="green", box=box.ROUNDED))
+        # ── Chat message (streaming) ──
+        buffer = ""
+        stream_panel = Panel(
+            Markdown(""),
+            title=Text.assemble((" NekoCode ", Style(color=theme.accent, bold=True))),
+            border_style=theme.accent, box=box.ROUNDED, padding=(0, 1),
+        )
+        try:
+            with Live(stream_panel, console=console, refresh_per_second=12, vertical_overflow="visible") as live:
+                for chunk in agent.ask_stream(user_input):
+                    buffer += chunk
+                    live.update(Panel(
+                        Markdown(buffer),
+                        title=Text.assemble((" NekoCode ", Style(color=theme.accent, bold=True))),
+                        border_style=theme.accent, box=box.ROUNDED, padding=(0, 1),
+                    ))
+        except GeneratorExit:
+            pass
