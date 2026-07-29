@@ -99,6 +99,8 @@ def show_help():
   [bold]/providers[/]  Список доступных провайдеров
   [bold]/provider[/] <name> Переключить провайдера
   [bold]/model[/] <name> Сменить модель
+  [bold]/tokens[/]     Статистика токенов
+  [bold]/economy[/] on|off|profile Вкл/выкл экономию, показать профиль
   [bold]/reset[/]      Сбросить сессию
   [bold]/exit[/]       Выйти
 
@@ -439,6 +441,32 @@ def main(argv=None):
             continue
         if base == "/providers":
             console.print(show_providers(agent, cfg))
+            continue
+        if base == "/tokens":
+            console.print(agent.tokens_dashboard())
+            continue
+        if base == "/economy":
+            if len(cmd) >= 2 and cmd[1] == "on":
+                agent.economy_enabled = True
+                console.print("[green]Экономия токенов включена.[/]")
+            elif len(cmd) >= 2 and cmd[1] == "off":
+                agent.economy_enabled = False
+                console.print("[yellow]Экономия токенов выключена.[/]")
+            elif len(cmd) >= 2 and cmd[1] == "profile":
+                budget = agent.token_budget
+                lines = [
+                    f"[bold]Профиль:[/] {agent._provider_name()}",
+                    f"[bold]Общий бюджет:[/] {budget.total:,} токенов",
+                    f"[bold]System:[/] {budget.system:,}",
+                    f"[bold]User msg:[/] {budget.user_msg:,}",
+                    f"[bold]History:[/] {budget.history:,}",
+                    f"[bold]Reserve:[/] {budget.reserve:,}",
+                    f"[bold]Статус:[/] {'[green]включена[/]' if agent.economy_enabled else '[red]выключена[/]'}",
+                ]
+                console.print(Panel("\n".join(lines), title="Token Economy", border_style="bright_cyan", box=box.ROUNDED))
+            else:
+                status = "включена" if agent.economy_enabled else "выключена"
+                console.print(f"[bold]Экономия:[/] {status}. [dim]/economy on|off|profile[/]")
             continue
         if base == "/reset":
             agent.reset()

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nekocode"
-version = "0.5.0"
-description = "NekoCode — Claude Code аналог: мульти-провайдер, скиллы, веб-инструменты, блюпринты, техдолг, постоянная память, русский интерфейс"
+version = "0.6.0"
+description = "NekoCode — Claude Code аналог: мульти-провайдер, скиллы, веб-инструменты, блюпринты, техдолг, экономия токенов, русский интерфейс"
 requires-python = ">=3.10"
 dependencies = [
     "rich>=13.0.0",

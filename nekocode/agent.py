@@ -14,6 +14,10 @@ from pathlib import Path
 
 from nekocode.prompts import build_system_prompt
 from nekocode.memory import MemoryStore
+from nekocode.economy import (
+    TokenCounter, TokenBudget, ContextWindow,
+    ContextCompressor, PriorityScorer, TokenTracker,
+)
 
 
 MAX_TOOL_OUTPUT = 4000
@@ -298,7 +302,30 @@ class MiniAgent:
             "history": [], "memory": {"task": "", "files": [], "notes": [], "blueprints": [], "tasks": []},
         }
         self.system_prompt = build_system_prompt(workspace, self.memory_store)
+
+        # Token economy
+        economy_enabled = self.config.get("economy", {}).get("enabled", True) if self.config else True
+        self.economy_enabled = economy_enabled
+        self.token_counter = TokenCounter(self._provider_name())
+        self.token_budget = TokenBudget.from_provider(self._provider_name(), self._model_name(), overrides=self.config.get("economy", {}).get("budget") if self.config else None)
+        self.priority_scorer = PriorityScorer()
+        self.context_compressor = ContextCompressor(self._provider_name(), self.config.get("economy", {}).get("strategies") if self.config else None)
+        self.context_window = ContextWindow(budget=self.token_budget, counter=self.token_counter, scorer=self.priority_scorer, compressor=self.context_compressor, provider=self._provider_name())
+        self.token_tracker = TokenTracker()
+
         self.session_path = self.session_store.save(self.session)
+
+    def _provider_name(self):
+        if hasattr(self.model_client, 'provider_name'):
+            return self.model_client.provider_name
+        if hasattr(self.model_client, 'model'):
+            return getattr(self.model_client, 'model', 'ollama')
+        return 'ollama'
+
+    def _model_name(self):
+        if hasattr(self.model_client, 'model'):
+            return self.model_client.model
+        return None
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, memory_store=None, session_id=None, **kwargs):
@@ -307,6 +334,13 @@ class MiniAgent:
                    memory_store=memory_store, session=session, **kwargs)
 
     def prompt(self, user_message):
+        if self.economy_enabled:
+            full_system = f"{self.system_prompt}\n\n{self._memory_text()}"
+            return self.context_window.assemble(
+                history=self.session["history"],
+                system_prompt=full_system,
+                user_msg=user_message,
+            )
         return "\n\n".join([
             self.system_prompt,
             self._memory_text(),
@@ -368,14 +402,25 @@ class MiniAgent:
 
         while tool_steps < self.max_steps and attempts < max_att:
             attempts += 1
-            raw = self.model_client.complete(self.prompt(user_message), self.max_new_tokens)
+            if self.economy_enabled:
+                self.token_tracker.begin_step(attempts)
+                history_snapshot = self.session["history"][:]
+            prompt_text = self.prompt(user_message)
+            if self.economy_enabled:
+                self.token_tracker.record_prompt(prompt_text, self.token_counter)
+            raw = self.model_client.complete(prompt_text, self.max_new_tokens)
             kind, payload = self._parse(raw)
 
             if kind == "tool":
                 tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
+                if self.economy_enabled:
+                    self.token_tracker.record_response(raw, self.token_counter)
                 result = self._run_tool(name, args)
+                if self.economy_enabled:
+                    self.token_tracker.record_tool(name, self.token_counter.estimate(prompt_text), self.token_counter.estimate(raw))
+                    self.token_tracker.end_step()
                 self.record({"role": "tool", "name": name, "args": args, "content": result, "created_at": now()})
                 self._note_tool(name, args, result)
                 continue
@@ -385,6 +430,9 @@ class MiniAgent:
                 continue
 
             final = (payload or raw).strip()
+            if self.economy_enabled:
+                self.token_tracker.record_response(final, self.token_counter)
+                self.token_tracker.end_step()
             self.record({"role": "assistant", "content": final, "created_at": now()})
             return final
 
@@ -662,7 +710,11 @@ class MiniAgent:
         self.session["history"] = []
         self.session["memory"] = {"task": "", "files": [], "notes": [], "blueprints": [], "tasks": []}
         self.task_manager = TaskManager()
+        self.token_tracker.reset()
         self.session_store.save(self.session)
+
+    def tokens_dashboard(self):
+        return self.token_tracker.dashboard()
 
 
 # ── Tool Implementations ───────────────────────────────────────────

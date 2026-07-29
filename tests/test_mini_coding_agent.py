@@ -277,6 +277,7 @@ def test_prompt_top_level_sections_stay_flush_left_with_multiline_content(tmp_pa
         }
     )
 
+    agent.economy_enabled = False
     prompt = agent.prompt("is this issue legit?")
     lines = prompt.splitlines()
 
